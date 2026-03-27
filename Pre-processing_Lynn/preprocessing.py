@@ -93,16 +93,20 @@ def custom_filtering(df):
     return df
 
 
-def load_and_filter(file_path, zone_lookup_url):
+def load_and_filter(file_path, zone_lookup_url, sample_size=None):
     """
     Loads raw parquet, applies all filters, and adds zone/borough info.
+
+    If sample_size is provided, sample the raw data first to reduce memory.
 
     Returns:
     - df_step1          : all NYC trips after integrity checks (used in EDA scope plots)
     - df_manhattan      : Manhattan-only scoped trips
     - zone_map_manhattan: dict mapping LocationID to Zone name for Manhattan zones
     """
-    df_raw   = pq.read_table(file_path).to_pandas()
+    df_raw = pq.read_table(file_path).to_pandas()
+    if sample_size is not None and len(df_raw) > sample_size:
+        df_raw = df_raw.sample(sample_size, random_state=42)
     df_step1 = standard_filtering(df_raw)
     df_step1 = extract_time_features(df_step1)
 
@@ -197,9 +201,12 @@ def _make_strata_key(df):
     return strata_key
 
 
-def make_train_test(df_clean):
+def make_train_test(df_clean, sample_size=None):
     """
     Stratified train/test split on hour period x zone cluster.
+
+    Parameters:
+    - sample_size: if not None, sample df_clean to this size before train/test split.
 
     Stratification ensures that the distribution of time periods and pickup
     zones is proportionally identical in train and test — important because
@@ -211,6 +218,9 @@ def make_train_test(df_clean):
 
     Returns: X_train, X_test, y_train, y_test, kfold
     """
+    if sample_size is not None and len(df_clean) > sample_size:
+        df_clean = df_clean.sample(sample_size, random_state=SPLIT_RANDOM_STATE)
+
     df_model = df_clean[MODEL_FEATURES + [TARGET]].dropna().copy()
 
     X = df_model[MODEL_FEATURES]
@@ -249,9 +259,12 @@ def make_train_test(df_clean):
 # 4. MAIN
 # =============================================================================
 
-def main(file_path=FILE_PATH, zone_url=ZONE_URL):
+def main(file_path=FILE_PATH, zone_url=ZONE_URL, sample_size=None):
     """
     Full preprocessing pipeline.
+
+    Arguments:
+    - sample_size: if provided, sample the raw data to this size before processing.
 
     Returns:
     - X_train, X_test, y_train, y_test : ready for model training
@@ -265,7 +278,7 @@ def main(file_path=FILE_PATH, zone_url=ZONE_URL):
         return None
 
     print("Loading and filtering data...")
-    df_step1, df_manhattan, zone_map_manhattan = load_and_filter(file_path, zone_url)
+    df_step1, df_manhattan, zone_map_manhattan = load_and_filter(file_path, zone_url, sample_size=sample_size)
 
     print("Detecting outliers...")
     df_work  = run_outlier_detection(df_manhattan)
@@ -273,7 +286,7 @@ def main(file_path=FILE_PATH, zone_url=ZONE_URL):
     df_clean['fare per mile'] = df_clean['fare_amount'] / df_clean['trip_distance']
 
     print("Creating stratified train/test split...")
-    X_train, X_test, y_train, y_test, kfold = make_train_test(df_clean)
+    X_train, X_test, y_train, y_test, kfold = make_train_test(df_clean, sample_size=sample_size)
 
     print("Preprocessing complete. Ready for model training!")
 

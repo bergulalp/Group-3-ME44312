@@ -22,7 +22,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 # Raw data file — place the parquet file two levels above this script,
 # or update this path to wherever the file is stored on your machine.
 FILE_PATH = os.path.normpath(
-    os.path.join(PROJECT_ROOT, "..", "..", "yellow_tripdata_2025-01.parquet")
+    os.path.join("/home/pimovergaag/Documents/ME43321/data/raw_data/yellow_tripdata_2025-01.parquet")
 )
 
 # NYC Taxi Zone lookup CSV — used to map LocationID to Borough and Zone name.

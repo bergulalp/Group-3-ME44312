@@ -9,7 +9,7 @@ Created on Mon Mar 23 13:45:42 2026
 import os
 
 # Data Path - Update this to your local path
-DATA_PATH = "yellow_tripdata_2025-01 (1).parquet"
+DATA_PATH = "/home/pimovergaag/Documents/ME43321/data/raw_data/yellow_tripdata_2025-01.parquet"
 
 # Cleaning Thresholds
 MIN_FARE = 2.50
