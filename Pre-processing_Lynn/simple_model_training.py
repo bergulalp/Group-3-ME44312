@@ -12,7 +12,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, m
 import argparse
 from preprocessing import main
 
-def run_models(pre_sample=100000, train_sample=None, test_sample=None):
+def run_models(pre_sample=100000, train_sample=50000, test_sample=10000):
     # Get preprocessed data from Lynn's pipeline
     result = main(sample_size=pre_sample)
     if result is None:
