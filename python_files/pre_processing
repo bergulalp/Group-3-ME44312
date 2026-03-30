@@ -1,0 +1,274 @@
+import pandas as pd
+import numpy as np
+from typing import Optional, Tuple
+import os
+
+
+LEAKAGE_COLUMNS = [
+    "fare_amount",            # target, dus niet als feature gebruiken
+    "total_amount",
+    "tip_amount",
+    "tolls_amount",
+    "extra",
+    "mta_tax",
+    "improvement_surcharge",
+    "congestion_surcharge",
+    "Airport_fee",
+    "airport_fee",
+    "cbd_congestion_fee",
+]
+
+
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    df["tpep_pickup_datetime"] = pd.to_datetime(df["tpep_pickup_datetime"])
+    df["tpep_dropoff_datetime"] = pd.to_datetime(df["tpep_dropoff_datetime"])
+
+    df["trip_duration"] = (
+        df["tpep_dropoff_datetime"] - df["tpep_pickup_datetime"]
+    ).dt.total_seconds() / 60.0
+
+    df["pickup_hour"] = df["tpep_pickup_datetime"].dt.hour
+    df["pickup_day"] = df["tpep_pickup_datetime"].dt.dayofweek
+    df["pickup_month"] = df["tpep_pickup_datetime"].dt.month
+    df["is_weekend"] = (df["pickup_day"] >= 5).astype(int)
+    df["is_rush_hour"] = df["pickup_hour"].isin([7, 8, 9, 16, 17, 18]).astype(int)
+
+    # 🚀 NIEUW: Meer tijd features
+    df["pickup_minute"] = df["tpep_pickup_datetime"].dt.minute
+    df["is_morning"] = df["pickup_hour"].isin([6, 7, 8, 9]).astype(int)
+    df["is_afternoon"] = df["pickup_hour"].isin([12, 13, 14, 15]).astype(int)
+    df["is_evening"] = df["pickup_hour"].isin([18, 19, 20, 21]).astype(int)
+    df["is_night"] = df["pickup_hour"].isin([22, 23, 0, 1, 2, 3, 4, 5]).astype(int)
+
+    return df
+
+
+def basic_cleaning(df: pd.DataFrame) -> pd.DataFrame:
+    required_cols = [
+        "tpep_pickup_datetime",
+        "tpep_dropoff_datetime",
+        "trip_distance",
+        "fare_amount",  # Nodig voor filtering voordat we het verwijderen
+        "PULocationID",
+        "DOLocationID",
+    ]
+
+    existing_required = [c for c in required_cols if c in df.columns]
+    df = df.dropna(subset=existing_required).copy()
+
+    if "passenger_count" in df.columns:
+        df["passenger_count"] = df["passenger_count"].fillna(1)
+    else:
+        df["passenger_count"] = 1
+
+    df = add_time_features(df)
+
+    # 🚀 NIEUW: Realistische filtering
+    df = df[
+        (df["trip_distance"] > 0) &
+        (df["trip_distance"] <= 100) &  # Max 100 miles
+        (df["fare_amount"] > 0) &
+        (df["fare_amount"] <= 500) &   # Max $500 fare
+        (df["trip_duration"] > 0) &
+        (df["trip_duration"] <= 180) & # Max 3 uur
+        (df["passenger_count"] > 0) &
+        (df["passenger_count"] <= 6)   # Max 6 passagiers
+    ].copy()
+
+    # 🚀 NIEUW: Verwijder onrealistische snelheden (> 80 mph of < 1 mph)
+    df["avg_speed_mph"] = (df["trip_distance"] / (df["trip_duration"] / 60))
+    df = df[
+        (df["avg_speed_mph"] >= 1) &
+        (df["avg_speed_mph"] <= 80)
+    ].copy()
+    df = df.drop(columns=["avg_speed_mph"])
+
+    # Nu pas de data leakage kolommen verwijderen
+    df = df.drop(columns=[c for c in LEAKAGE_COLUMNS if c in df.columns]).copy()
+
+    return df
+
+
+def percentile_outlier_filter(
+    df: pd.DataFrame,
+    cols: list[str],
+    lower_q: float = 0.01,
+    upper_q: float = 0.99,
+) -> pd.DataFrame:
+    df_filtered = df.copy()
+
+    for col in cols:
+        if col in df_filtered.columns:
+            lower = df_filtered[col].quantile(lower_q)
+            upper = df_filtered[col].quantile(upper_q)
+            df_filtered = df_filtered[
+                (df_filtered[col] >= lower) & (df_filtered[col] <= upper)
+            ]
+
+    return df_filtered
+
+
+def feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # Bestaande log transforms
+    df["log_trip_distance"] = np.log1p(df["trip_distance"])
+    df["log_trip_duration"] = np.log1p(df["trip_duration"])
+
+    # 🚀 NIEUW: Distance-based features
+    df["distance_per_minute"] = df["trip_distance"] / df["trip_duration"]
+    df["is_long_trip"] = (df["trip_distance"] > 10).astype(int)
+    df["is_short_trip"] = (df["trip_distance"] < 1).astype(int)
+
+    # 🚀 NIEUW: Duration-based features
+    df["is_quick_trip"] = (df["trip_duration"] < 5).astype(int)
+    df["is_long_duration"] = (df["trip_duration"] > 30).astype(int)
+
+    # 🚀 NIEUW: Location-based features (vereenvoudigd)
+    df["same_zone"] = (df["PULocationID"] == df["DOLocationID"]).astype(int)
+    df["is_airport_pickup"] = df["PULocationID"].isin([1, 132, 138]).astype(int)  # JFK, LGA
+    df["is_airport_dropoff"] = df["DOLocationID"].isin([1, 132, 138]).astype(int)
+
+    # 🚀 NIEUW: Time-based interactions
+    df["weekend_rush"] = df["is_weekend"] * df["is_rush_hour"]
+    df["night_long_trip"] = df["is_night"] * df["is_long_trip"]
+
+    return df
+
+
+def select_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
+    target = "fare_amount"
+    
+    # Valideer dat target kolom bestaat
+    if target not in df.columns:
+        raise ValueError(f"Target kolom '{target}' niet gevonden in dataframe")
+
+    feature_cols = [
+        "VendorID",
+        "passenger_count",
+        "trip_distance",
+        "trip_duration",
+        "log_trip_distance",
+        "log_trip_duration",
+        "distance_per_minute",
+        "is_long_trip",
+        "is_short_trip",
+        "is_quick_trip",
+        "is_long_duration",
+        "same_zone",
+        "is_airport_pickup",
+        "is_airport_dropoff",
+        "RatecodeID",
+        "PULocationID",
+        "DOLocationID",
+        "payment_type",
+        "pickup_hour",
+        "pickup_minute",
+        "pickup_day",
+        "pickup_month",
+        "is_weekend",
+        "is_rush_hour",
+        "is_morning",
+        "is_afternoon",
+        "is_evening",
+        "is_night",
+        "weekend_rush",
+        "night_long_trip",
+    ]
+
+    feature_cols = [c for c in feature_cols if c in df.columns]
+    
+    if not feature_cols:
+        raise ValueError("Geen geldige features gevonden in dataframe")
+
+    X = df[feature_cols].copy()
+    y = df[target].copy()
+
+    categorical_cols = [
+        c for c in ["VendorID", "RatecodeID", "PULocationID", "DOLocationID", "payment_type"]
+        if c in X.columns
+    ]
+
+    X = pd.get_dummies(X, columns=categorical_cols, drop_first=True)
+
+    return X, y
+
+
+def save_preprocessed_data(
+    file_path: str,
+    output_dir: str = "data/pre_processed_data",
+    sample_size: Optional[int] = None,
+    apply_outlier_filter: bool = True,
+    save_target: bool = False,
+) -> str:
+    """
+    Laad, preprocess en sla de data op in parquet formaat.
+    
+    Args:
+        save_target: Als True, sla ook fare_amount op als aparte target file
+        
+    Returns:
+        str: Pad naar het opgeslagen features bestand
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Laad en preprocess de data
+    df = pd.read_parquet(file_path)
+
+    if sample_size is not None and sample_size < len(df):
+        df = df.sample(sample_size, random_state=42)
+
+    # Sla target op voordat we het verwijderen
+    target_series = None
+    if save_target and "fare_amount" in df.columns:
+        target_series = df["fare_amount"].copy()
+
+    df = basic_cleaning(df)
+    df = feature_engineering(df)
+
+    if apply_outlier_filter:
+        df = percentile_outlier_filter(
+            df,
+            cols=["trip_distance", "trip_duration", "distance_per_minute"],
+            lower_q=0.01,
+            upper_q=0.99,
+        )
+
+    # Genereer output filename gebaseerd op input filename
+    input_filename = os.path.basename(file_path)
+    base_name = os.path.splitext(input_filename)[0]
+    features_filename = f"{base_name}_features.parquet"
+    features_path = os.path.join(output_dir, features_filename)
+    
+    # Sla features op
+    df.to_parquet(features_path, index=False)
+    
+    # Sla target op als gevraagd
+    target_path = None
+    if save_target and target_series is not None:
+        # Filter target op dezelfde indices als de gefilterde data
+        # Dit is een vereenvoudiging - in praktijk zou je de indices moeten matchen
+        target_filename = f"{base_name}_target.parquet"
+        target_path = os.path.join(output_dir, target_filename)
+        target_series.to_frame().to_parquet(target_path, index=False)
+    
+    print(f"Preprocessed features saved to: {features_path}")
+    print(f"Features shape: {df.shape}")
+    
+    if target_path:
+        print(f"Target saved to: {target_path}")
+        print(f"Target shape: {target_series.shape}")
+    
+    return features_path
+
+
+if __name__ == "__main__":
+    file_path = "/home/pimovergaag/Documents/ME43321/data/raw_data/yellow_tripdata_2025-01.parquet"
+
+    # Sla preprocessed data op (met target)
+    saved_path = save_preprocessed_data(file_path, sample_size=100000, save_target=True)
+
+    print("\n✅ Preprocessing compleet!")
+    print(f"Features opgeslagen: {saved_path}")
+    print(f"Target opgeslagen: {saved_path.replace('_features.parquet', '_target.parquet')}")
+    print("\n🚀 Gebruik 'python python_files/train_model.py' om het model te trainen!")

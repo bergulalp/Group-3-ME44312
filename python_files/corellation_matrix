@@ -1,0 +1,56 @@
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+
+def load_raw_for_correlation_parquet(file_path, sample_size=50000):
+    # Parquet inladen
+    df = pd.read_parquet(file_path)
+
+    # Sample meteen (scheelt geheugen!)
+    if len(df) > sample_size:
+        df = df.sample(sample_size, random_state=42)
+
+    # Basis cleaning
+    df = df.dropna()
+
+    # Datetime (vaak al correct in parquet, maar check)
+    df['tpep_pickup_datetime'] = pd.to_datetime(df['tpep_pickup_datetime'])
+    df['tpep_dropoff_datetime'] = pd.to_datetime(df['tpep_dropoff_datetime'])
+
+    # Feature engineering
+    df['trip_duration'] = (
+        df['tpep_dropoff_datetime'] - df['tpep_pickup_datetime']
+    ).dt.total_seconds() / 60
+
+    df['pickup_hour'] = df['tpep_pickup_datetime'].dt.hour
+    df['pickup_day'] = df['tpep_pickup_datetime'].dt.dayofweek
+
+    # Alleen numerieke kolommen
+    df_numeric = df.select_dtypes(include=[np.number])
+
+    return df_numeric
+
+def plot_correlation(df_numeric):
+    # Sample (anders te zwaar!)
+    sample_size = min(50000, len(df_numeric))
+    df_sample = df_numeric.sample(sample_size, random_state=42)
+
+    corr = df_sample.corr()
+
+    plt.figure(figsize=(14, 10))
+    sns.heatmap(corr, cmap='coolwarm', center=0)
+    plt.title("Full Correlation Matrix")
+    plt.show()
+
+    # Focus op target
+    target_corr = corr['fare_amount'].sort_values(ascending=False)
+    print("\nCorrelation with fare_amount:\n")
+    print(target_corr)
+
+if __name__ == "__main__":
+    file_path = "/home/pimovergaag/Documents/ME43321/data/raw_data/yellow_tripdata_2025-01.parquet"
+
+    df_numeric = load_raw_for_correlation_parquet(file_path)
+
+    plot_correlation(df_numeric)
