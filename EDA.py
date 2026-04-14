@@ -1,31 +1,30 @@
-"""
-eda.py
-------
-Exploratory Data Analysis for the NYC Taxi Fare Prediction project.
-
-Imports the preprocessing pipeline from preprocessing.py and runs all
-visualizations and statistical summaries on the clean data. No data
-transformation or model-related logic lives here.
-
-All configuration values (paths, thresholds, plot settings) are
-imported from config.py. This file contains no hardcoded values.
-
-Run directly to produce all plots and print statistics:
-    python eda.py
-"""
+# =============================================================================
+# EDA.py (Exploratory Data Analysis)
+#
+# PURPOSE:
+# This script generates the visual and statistical proof needed to justify our 
+# preprocessing decisions in the final report. 
+#
+# ARCHITECTURE NOTE:
+# This script loads and processes its own data rather than importing the ML 
+# preprocessing pipeline. This ensures we can visualize intermediate states 
+# (like tracking outliers before they are removed) without cluttering or 
+# breaking the heavily optimized model training scripts.
+# =============================================================================
 
 import os
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
+from sklearn.ensemble import IsolationForest
 
-from preprocessing import main as run_preprocessing
 from config import (
-    FILE_PATH, ZONE_URL,
+    FILE_PATH, ZONE_URL, KEEP_COLUMNS, FEE_COLUMNS,
     MODEL_FEATURES,
     QUASI_CONSTANT_FEATURES, QUASI_CONSTANT_THRESHOLD,
     DIST_BINS, DIST_LABELS, DAY_LABELS,
@@ -36,43 +35,92 @@ from config import (
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# =============================================================================
+# 0. DEDICATED EDA DATA LOADING
+# =============================================================================
+
+def load_eda_data():
+    """
+    Loads and processes data specifically for visualization purposes.
+    Unlike the ML pipeline, this keeps track of intermediate states (like 
+    before/after outlier removal) so we can plot the differences.
+    """
+    print("[INFO] Loading raw data for EDA...")
+    df = pq.read_table(FILE_PATH).to_pandas()[KEEP_COLUMNS].dropna()
+    
+    # Basic logical cleaning
+    for col in FEE_COLUMNS: 
+        df = df[df[col] >= 0]
+    df = df[(df['passenger_count'] >= 1) & (df['passenger_count'] <= 6)]
+    df = df[(df['trip_distance'] > 0) & (df['fare_amount'] > 0) & (df['fare_amount'] <= 50)]
+    df = df[df['RatecodeID'] == 1]
+    
+    # Time features
+    df['tpep_pickup_datetime'] = pd.to_datetime(df['tpep_pickup_datetime'])
+    df['tpep_dropoff_datetime'] = pd.to_datetime(df['tpep_dropoff_datetime'])
+    df['hour'] = df['tpep_pickup_datetime'].dt.hour
+    df['day of week'] = df['tpep_pickup_datetime'].dt.dayofweek
+    df['is weekend'] = df['day of week'].isin([5, 6]).astype(int)
+    df['trip_duration_min'] = (df['tpep_dropoff_datetime'] - df['tpep_pickup_datetime']).dt.total_seconds() / 60
+    
+    # Borough mapping
+    zone_df = pd.read_csv(ZONE_URL)
+    z_map = zone_df.set_index('LocationID')['Borough'].to_dict()
+    zone_map_manhattan = zone_df[zone_df['Borough'] == 'Manhattan'].set_index('LocationID')['Zone'].to_dict()
+    
+    df['PU_Borough'] = df['PULocationID'].map(z_map)
+    df['DO_Borough'] = df['DOLocationID'].map(z_map)
+    
+    df_step1 = df.copy() # All NYC data
+    
+    # Filter to Manhattan
+    print("[INFO] Filtering to Manhattan...")
+    df_manhattan = df[(df['PU_Borough'] == 'Manhattan') & (df['DO_Borough'] == 'Manhattan')].copy()
+    
+    # Outlier Detection (Tagging instead of dropping immediately)
+    print("[INFO] Tagging outliers with Isolation Forest...")
+    clf = IsolationForest(contamination=0.01, random_state=42).fit(df_manhattan[['fare_amount', 'trip_distance']])
+    df_manhattan['is outlier'] = clf.predict(df_manhattan[['fare_amount', 'trip_distance']]) == -1
+    
+    df_work = df_manhattan.copy() # Contains the 'is outlier' flags for plotting
+    df_clean = df_manhattan[df_manhattan['is outlier'] == False].copy()
+    
+    # Calculate target encoded fare for PCA diagnostics
+    pu_map = df_clean.groupby('PULocationID')['fare_amount'].mean().to_dict()
+    df_clean['PU_fare_avg'] = df_clean['PULocationID'].map(pu_map)
+    
+    # Distance bins for EDA
+    df_clean['distance bin'] = pd.cut(df_clean['trip_distance'], bins=DIST_BINS, labels=DIST_LABELS)
+    df_clean['fare per mile'] = df_clean['fare_amount'] / df_clean['trip_distance']
+    
+    return df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan
 
 # =============================================================================
 # 1. FEATURE ANALYSIS
 # =============================================================================
 
 def get_active_features(df):
-    """
-    Returns features that are not quasi-constant.
-    Columns whose most frequent value exceeds QUASI_CONSTANT_THRESHOLD
-    carry near-zero variance and are excluded from correlation and PCA analysis.
-    """
+    """Identifies and returns features that contain meaningful variance."""
     active_features = []
     print(f"\n--- QUASI-CONSTANT ANALYSIS (Threshold: {QUASI_CONSTANT_THRESHOLD * 100}%) ---")
+    
     for col in QUASI_CONSTANT_FEATURES:
         if col in df.columns:
             most_freq_perc = df[col].value_counts(normalize=True).iloc[0]
             is_quasi = most_freq_perc >= QUASI_CONSTANT_THRESHOLD
             status   = "DROP (quasi-constant)" if is_quasi else "KEEP"
+            
             print(f"  '{col:25}': top value = {most_freq_perc * 100:6.2f}%  ->  {status}")
             if not is_quasi:
                 active_features.append(col)
+                
     print(f"\n  Active features kept: {active_features}")
     return active_features
 
-
 def run_diagnostics(df, active_features):
-    """
-    Correlation heatmap of active features.
-    PULocationID is added as a mean-encoded zone feature (average fare per pickup
-    zone) to capture spatial signal without high-cardinality dummy columns.
-    fare_amount is excluded — it is the prediction target, not a predictor.
-    """
+    """Generates a correlation heatmap for the active features."""
     corr_df = df[active_features].copy()
-
-    zone_mean_fare = df.groupby('PULocationID')['fare_amount'].transform('mean')
-    corr_df['pickup zone (mean fare)'] = zone_mean_fare
-
+    
     if 'fare_amount' in corr_df.columns:
         corr_df = corr_df.drop(columns=['fare_amount'])
 
@@ -84,18 +132,8 @@ def run_diagnostics(df, active_features):
     plt.tight_layout()
     plt.show()
 
-
 def run_pca_99(df, active_features):
-    """
-    PCA for dimensionality insight. Used as a diagnostic tool only,
-    not as input to any model.
-
-    Produces:
-    - Scree plot: number of components needed to explain 99% of variance.
-    - Loadings table printed to console: per-component feature weights.
-    - Biplot: feature directions in PC1/PC2 space. Arrows pointing in the
-      same direction indicate correlated features.
-    """
+    """Performs PCA strictly for diagnostic insight (scree plot & biplot)."""
     features    = df[active_features].copy()
     clean_names = [c.replace('_', ' ') for c in features.columns]
     scaled_data = StandardScaler().fit_transform(features)
@@ -106,10 +144,8 @@ def run_pca_99(df, active_features):
 
     # Scree plot
     plt.figure(figsize=(10, 5))
-    plt.bar(range(1, n_components + 1), pca_full.explained_variance_ratio_,
-            alpha=0.7, color='teal', label='Individual variance')
-    plt.step(range(1, n_components + 1), np.cumsum(pca_full.explained_variance_ratio_),
-             where='mid', color='red', label='Cumulative variance')
+    plt.bar(range(1, n_components + 1), pca_full.explained_variance_ratio_, alpha=0.7, color='teal', label='Individual variance')
+    plt.step(range(1, n_components + 1), np.cumsum(pca_full.explained_variance_ratio_), where='mid', color='red', label='Cumulative variance')
     plt.axhline(0.99, color='gray', linestyle='--', alpha=0.5, label='99% threshold')
     plt.title(f'PCA Scree Plot — {n_components} components explain 99% variance')
     plt.xlabel('Principal Component')
@@ -118,66 +154,12 @@ def run_pca_99(df, active_features):
     plt.tight_layout()
     plt.show()
 
-    # Loadings table
-    print("\n--- PCA COMPONENT LOADINGS ---")
-    loadings_df = pd.DataFrame(
-        pca_full.components_,
-        columns=clean_names,
-        index=[f'PC{i + 1}' for i in range(n_components)]
-    )
-    print(f"\n{'':6}", end='')
-    for name in clean_names:
-        print(f"{name:>22}", end='')
-    print()
-    for pc in loadings_df.index:
-        var_pct = pca_full.explained_variance_ratio_[loadings_df.index.get_loc(pc)] * 100
-        print(f"{pc} ({var_pct:4.1f}%)", end='  ')
-        for val in loadings_df.loc[pc]:
-            bar  = 'X' * int(abs(val) * 10)
-            sign = '+' if val >= 0 else '-'
-            print(f"{sign}{abs(val):.2f} {bar:10}", end='  ')
-        print()
-
-    # Biplot
-    pca2        = PCA(n_components=2)
-    coords      = pca2.fit_transform(scaled_data)
-    sample_idx  = np.random.choice(len(coords), size=min(3000, len(coords)), replace=False)
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.scatter(coords[sample_idx, 0], coords[sample_idx, 1],
-               alpha=0.15, s=5, color='steelblue')
-
-    loadings = pca2.components_.T
-    scale    = 3
-    for i, name in enumerate(clean_names):
-        ax.annotate('', xy=(loadings[i, 0] * scale, loadings[i, 1] * scale),
-                    xytext=(0, 0),
-                    arrowprops=dict(arrowstyle='->', color='darkred', lw=1.8))
-        ax.text(loadings[i, 0] * scale * 1.12, loadings[i, 1] * scale * 1.12,
-                name, fontsize=9, color='darkred')
-
-    ax.axhline(0, color='gray', lw=0.5)
-    ax.axvline(0, color='gray', lw=0.5)
-    ax.set_xlabel(f'PC1 ({pca2.explained_variance_ratio_[0] * 100:.1f}% variance)')
-    ax.set_ylabel(f'PC2 ({pca2.explained_variance_ratio_[1] * 100:.1f}% variance)')
-    ax.set_title('PCA Biplot — Feature Directions in PC1/PC2 Space')
-    plt.tight_layout()
-    plt.show()
-
-
 # =============================================================================
 # 2. VISUALIZATIONS
 # =============================================================================
 
 def plot_manhattan_heatmap(df_clean):
-    """
-    Choropleth map of Manhattan taxi zones shaded by average fare (left)
-    and pickup volume (right). Requires geopandas to be installed.
-
-    The shapefile must be downloaded and unzipped manually into the folder
-    specified by SHAPEFILE_DIR in config.py.
-    Download from: https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip
-    """
+    """Creates a geographic choropleth map of Manhattan taxi zones."""
     try:
         import geopandas as gpd
     except ImportError:
@@ -186,16 +168,13 @@ def plot_manhattan_heatmap(df_clean):
 
     if not os.path.exists(SHAPEFILE_DIR):
         print(f"  [Map skipped] Folder '{SHAPEFILE_DIR}/' not found.")
-        print(f"  Download and unzip: https://d37ci6vzurychx.cloudfront.net/misc/taxi_zones.zip")
         return
 
     shp_files = [f for f in os.listdir(SHAPEFILE_DIR) if f.endswith(".shp")]
     if not shp_files:
-        print(f"  [Map skipped] No .shp file found in '{SHAPEFILE_DIR}/'.")
         return
 
     shp_path = os.path.join(SHAPEFILE_DIR, shp_files[0])
-    print(f"  Loading shapefile: {shp_path}")
     gdf = gpd.read_file(shp_path)
 
     zone_fare          = df_clean.groupby('PULocationID')['fare_amount'].mean().reset_index()
@@ -228,31 +207,17 @@ def plot_manhattan_heatmap(df_clean):
     plt.tight_layout()
     plt.show()
 
-
 def run_visuals(df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan):
-    """
-    All EDA visualizations in logical report order.
+    """Executes the suite of EDA visualizations in logical report order."""
 
-     1. LocationID volume bars — All NYC (shows zone imbalance)
-     2. Borough skewness — All NYC (justifies Manhattan scope)
-     3. Manhattan zone demand — Top 20 and Bottom 20 named zones
-     4. Before/after outlier scatter — duration vs fare, colored by fare/mile
-     5. Fare distribution — shape of the target variable
-     6. Fare per mile by distance bin — base fare effect
-     7. Temporal heatmap — average fare by hour and day of week
-     8. Trip distance distribution — dataset composition
-     9. Fee occurrence — justifies dropping quasi-constant fees
-    10. Boxplot fare per distance bin — spread within each bin
-    11. Trip volume per hour — weekday vs weekend demand pattern
-    12. Manhattan choropleth map — spatial fare and volume heatmap
-    """
-
-    # ---- 1. LocationID volume — All NYC ----
+    # -------------------------------------------------------------------------
+    # 1. LocationID Volume (All NYC)
+    # WHY: To visually demonstrate the extreme spatial imbalance in the dataset.
+    # WHAT: A bar chart showing trip counts per zone, highlighting the peaks and valleys.
+    # -------------------------------------------------------------------------
     for loc_col, label in [('PULocationID', 'Pickup'), ('DOLocationID', 'Dropoff')]:
         loc_counts = df_step1[loc_col].value_counts().sort_index()
-        colors = ['green' if v == loc_counts.max()
-                  else 'red' if v == loc_counts.min()
-                  else 'skyblue' for v in loc_counts]
+        colors = ['green' if v == loc_counts.max() else 'red' if v == loc_counts.min() else 'skyblue' for v in loc_counts]
         plt.figure(figsize=(15, 4))
         plt.bar(loc_counts.index.astype(str), loc_counts.values, color=colors)
         plt.title(f"{label} Volume by LocationID — Full NYC (shape shows zone imbalance)")
@@ -261,7 +226,11 @@ def run_visuals(df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan):
         plt.tight_layout()
         plt.show()
 
-    # ---- 2. Borough skewness — All NYC ----
+    # -------------------------------------------------------------------------
+    # 2. Borough Skewness (All NYC)
+    # WHY: To mathematically justify our decision to filter the dataset strictly to Manhattan.
+    # WHAT: A bar chart proving that Manhattan handles the vast majority of taxi traffic.
+    # -------------------------------------------------------------------------
     plt.figure(figsize=(10, 5))
     boro_counts = df_step1['PU_Borough'].value_counts()
     sns.barplot(x=boro_counts.index, y=boro_counts.values, palette='viridis')
@@ -270,13 +239,18 @@ def run_visuals(df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan):
     plt.tight_layout()
     plt.show()
 
-    # ---- 3. Manhattan zone demand ----
+    # -------------------------------------------------------------------------
+    # 3. Manhattan Zone Demand
+    # WHY: To identify the specific neighborhoods driving the most revenue and traffic.
+    # WHAT: Horizontal bar charts of the top 20 and bottom 20 most popular pickup zones.
+    # -------------------------------------------------------------------------
     pu_counts = df_clean['PULocationID'].value_counts().rename(index=zone_map_manhattan)
     fig, axes = plt.subplots(1, 2, figsize=(16, 8))
     pu_counts.head(20).plot(kind='barh', ax=axes[0], color='darkgreen')
     axes[0].set_title("Top 20 Manhattan Pickup Zones")
     axes[0].invert_yaxis()
     axes[0].set_xlabel("Number of Trips")
+    
     pu_counts.tail(20).plot(kind='barh', ax=axes[1], color='firebrick')
     axes[1].set_title("Bottom 20 Manhattan Pickup Zones")
     axes[1].invert_yaxis()
@@ -285,7 +259,12 @@ def run_visuals(df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan):
     plt.tight_layout()
     plt.show()
 
-    # ---- 4. Before/After Outlier Scatter ----
+    # -------------------------------------------------------------------------
+    # 4. Before/After Outlier Scatter
+    # WHY: To visually prove that the IsolationForest algorithm successfully caught 
+    #      and removed physically impossible trips (e.g., 0 duration but $100 fare).
+    # WHAT: Scatter plot comparing Trip Duration vs Fare Amount, with outliers highlighted in red.
+    # -------------------------------------------------------------------------
     outliers = df_work[df_work['is outlier'] == True]
     inliers  = df_work[df_work['is outlier'] == False]
 
@@ -294,6 +273,7 @@ def run_visuals(df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan):
 
     inlier_sample  = inliers.sample(normal_sample_size, random_state=42).copy()
     outlier_sample = outliers.sample(outlier_sample_size, random_state=42).copy()
+    
     inlier_sample['fare per mile']  = inlier_sample['fare_amount']  / inlier_sample['trip_distance']
     outlier_sample['fare per mile'] = outlier_sample['fare_amount'] / outlier_sample['trip_distance']
 
@@ -301,8 +281,7 @@ def run_visuals(df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan):
     sc = axes[0].scatter(
         inlier_sample['trip_duration_min'], inlier_sample['fare_amount'],
         c=inlier_sample['fare per mile'].clip(FARE_PER_MILE_VMIN, FARE_PER_MILE_VMAX),
-        cmap='YlGnBu', alpha=0.4, s=3,
-        vmin=FARE_PER_MILE_VMIN, vmax=FARE_PER_MILE_VMAX, zorder=1
+        cmap='YlGnBu', alpha=0.4, s=3, vmin=FARE_PER_MILE_VMIN, vmax=FARE_PER_MILE_VMAX, zorder=1
     )
     axes[0].scatter(
         outlier_sample['trip_duration_min'], outlier_sample['fare_amount'],
@@ -319,8 +298,7 @@ def run_visuals(df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan):
     sc2 = axes[1].scatter(
         final_sample['trip_duration_min'], final_sample['fare_amount'],
         c=final_sample['fare per mile'].clip(FARE_PER_MILE_VMIN, FARE_PER_MILE_VMAX),
-        cmap='YlGnBu', alpha=0.4, s=3,
-        vmin=FARE_PER_MILE_VMIN, vmax=FARE_PER_MILE_VMAX
+        cmap='YlGnBu', alpha=0.4, s=3, vmin=FARE_PER_MILE_VMIN, vmax=FARE_PER_MILE_VMAX
     )
     axes[1].set_xlim(0, 90); axes[1].set_ylim(0, 150)
     axes[1].set_title(f"After: {len(df_clean):,} Clean Trips")
@@ -330,34 +308,45 @@ def run_visuals(df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan):
     plt.tight_layout()
     plt.show()
 
-    # ---- 5. Fare distribution ----
+    # -------------------------------------------------------------------------
+    # 5. Fare Distribution
+    # WHY: To understand the shape of our target variable. Because it is highly 
+    #      right-skewed, this justifies why we needed data balancing in preprocessing.py.
+    # WHAT: A histogram showing the frequency of different fare amounts.
+    # -------------------------------------------------------------------------
     fare_max = df_clean['fare_amount'].max()
     fare_cap = min(100, np.ceil(fare_max / 5) * 5)
-    cap_note = (f"view capped at ${fare_cap:.0f}"
-                if fare_cap < fare_max else f"showing full range up to ${fare_max:.0f}")
+    cap_note = (f"view capped at ${fare_cap:.0f}" if fare_cap < fare_max else f"showing full range up to ${fare_max:.0f}")
     plt.figure(figsize=(12, 5))
     sns.histplot(df_clean['fare_amount'], bins=80, color='darkgreen', kde=True)
     plt.xlim(0, fare_cap)
-    plt.title(f"Fare Amount Distribution — Manhattan (after outlier removal)\n"
-              f"Max fare: ${fare_max:.2f} | {cap_note}")
+    plt.title(f"Fare Amount Distribution — Manhattan (after outlier removal)\nMax fare: ${fare_max:.2f} | {cap_note}")
     plt.xlabel("Fare Amount ($)")
     plt.tight_layout()
     plt.show()
 
-    # ---- 6. Fare per mile by distance bin ----
-    df_clean = df_clean.copy()
-    df_clean['distance bin'] = pd.cut(df_clean['trip_distance'], bins=DIST_BINS, labels=DIST_LABELS)
-    bin_stats = df_clean.groupby('distance bin', observed=True)['fare per mile'].median().reset_index()
+    # -------------------------------------------------------------------------
+    # 6. Fare per Mile by Distance Bin
+    # WHY: To prove the non-linear relationship between distance and fare. Short 
+    #      trips have a high base fare, making them more expensive per mile.
+    # WHAT: A bar chart displaying the median cost of 1 mile depending on the total trip length.
+    # -------------------------------------------------------------------------
+    df_clean_copy = df_clean.copy()
+    df_clean_copy['distance bin'] = pd.cut(df_clean_copy['trip_distance'], bins=DIST_BINS, labels=DIST_LABELS)
+    bin_stats = df_clean_copy.groupby('distance bin', observed=True)['fare per mile'].median().reset_index()
     plt.figure(figsize=(10, 5))
     sns.barplot(data=bin_stats, x='distance bin', y='fare per mile', palette='YlOrRd')
-    plt.title("Median Fare per Mile by Distance Bin\n"
-              "(Short trips are disproportionately expensive per mile — base fare effect)")
+    plt.title("Median Fare per Mile by Distance Bin\n(Short trips are disproportionately expensive per mile — base fare effect)")
     plt.ylabel("Median Fare per Mile ($)")
     plt.xlabel("Trip Distance Bin")
     plt.tight_layout()
     plt.show()
 
-    # ---- 7. Temporal heatmap ----
+    # -------------------------------------------------------------------------
+    # 7. Temporal Heatmap
+    # WHY: To confirm that engineered time features (rush hour, night fare) contain real signal.
+    # WHAT: A matrix showing how the average fare fluctuates depending on the hour and day.
+    # -------------------------------------------------------------------------
     pivot = df_clean.groupby(['day of week', 'hour'])['fare_amount'].mean().unstack()
     pivot.index = DAY_LABELS
     plt.figure(figsize=(14, 5))
@@ -367,59 +356,76 @@ def run_visuals(df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan):
     plt.tight_layout()
     plt.show()
 
-    # ---- 8. Trip distance distribution ----
+    # -------------------------------------------------------------------------
+    # 8. Trip Distance Distribution
+    # WHY: To show the dataset composition. If 90% of trips are under 5 miles, 
+    #      the model will naturally be biased towards short trips without balancing.
+    # WHAT: A countplot of trip frequencies categorized by distance bins.
+    # -------------------------------------------------------------------------
     plt.figure(figsize=(10, 5))
-    sns.countplot(x=df_clean['distance bin'], palette='viridis')
+    sns.countplot(x=df_clean_copy['distance bin'], palette='viridis')
     plt.title("Trip Distance Distribution — Final Manhattan Dataset")
     plt.xlabel("Distance Bin")
     plt.tight_layout()
     plt.show()
 
-    # ---- 9. Fee occurrence ----
-    from config import FEE_COLUMNS
+    # -------------------------------------------------------------------------
+    # 9. Fee Occurrence
+    # WHY: To mathematically justify dropping quasi-constant columns. If a fee applies 
+    #      to 99.9% of trips, it provides zero predictive variance to the model.
+    # WHAT: A bar chart showing what percentage of trips include a specific NYC taxi fee.
+    # -------------------------------------------------------------------------
     fee_occurrence = (df_clean[FEE_COLUMNS] > 0).mean() * 100
     plt.figure(figsize=(10, 5))
-    sns.barplot(x=[c.replace('_', ' ') for c in fee_occurrence.index],
-                y=fee_occurrence.values, palette='magma')
-    plt.title("Percentage of Trips with Fee > $0\n"
-              "(Near-100% fees are quasi-constant — dropped from modeling)")
+    sns.barplot(x=[c.replace('_', ' ') for c in fee_occurrence.index], y=fee_occurrence.values, palette='magma')
+    plt.title("Percentage of Trips with Fee > $0\n(Near-100% fees are quasi-constant — dropped from modeling)")
     plt.ylabel("% of Trips"); plt.xticks(rotation=45)
     plt.tight_layout()
     plt.show()
 
-    # ---- 10. Boxplot fare per distance bin ----
+    # -------------------------------------------------------------------------
+    # 10. Boxplot Fare per Distance Bin
+    # WHY: To show that even when distance is perfectly constant, fare varies greatly 
+    #      (due to traffic/duration), highlighting why spatial/time features are vital.
+    # WHAT: Boxplots showing the spread (IQR) of fares within strict distance boundaries.
+    # -------------------------------------------------------------------------
     plt.figure(figsize=(11, 6))
-    sns.boxplot(data=df_clean, x='distance bin', y='fare_amount',
-                palette='YlOrRd', showfliers=False)
-    plt.title("Fare Amount Distribution per Distance Bin\n"
-              "(Box = IQR, line = median | fliers hidden — outliers already removed)")
+    sns.boxplot(data=df_clean_copy, x='distance bin', y='fare_amount', palette='YlOrRd', showfliers=False)
+    plt.title("Fare Amount Distribution per Distance Bin\n(Box = IQR, line = median | fliers hidden — outliers already removed)")
     plt.xlabel("Trip Distance Bin"); plt.ylabel("Fare Amount ($)")
     plt.tight_layout()
     plt.show()
 
-    # ---- 11. Trip volume per hour ----
+    # -------------------------------------------------------------------------
+    # 11. Trip Volume per Hour
+    # WHY: To show behavioral differences between weekday commutes and weekend nightlife, 
+    #      proving that the 'is_weekend' feature is a critical predictor for the model.
+    # WHAT: A dual line plot comparing total trip volume by hour on weekends vs weekdays.
+    # -------------------------------------------------------------------------
     hourly = df_clean.groupby(['hour', 'is weekend']).size().reset_index(name='trip_count')
     hourly['day type'] = hourly['is weekend'].map({0: 'Weekday', 1: 'Weekend'})
     plt.figure(figsize=(12, 5))
-    sns.lineplot(data=hourly, x='hour', y='trip_count',
-                 hue='day type', marker='o', palette=['steelblue', 'darkorange'])
-    plt.title("Trip Volume per Hour — Weekday vs Weekend\n"
-              "(Shows where the model has most training data)")
+    sns.lineplot(data=hourly, x='hour', y='trip_count', hue='day type', marker='o', palette=['steelblue', 'darkorange'])
+    plt.title("Trip Volume per Hour — Weekday vs Weekend\n(Shows where the model has most training data)")
     plt.xlabel("Hour of Day"); plt.ylabel("Number of Trips")
     plt.xticks(range(0, 24)); plt.legend(title='')
     plt.tight_layout()
     plt.show()
 
-    # ---- 12. Manhattan choropleth map ----
+    # -------------------------------------------------------------------------
+    # 12. Manhattan Choropleth Map
+    # WHY: To provide an intuitive, geographic visualization of where the highest 
+    #      value and highest volume zones are located in the real world.
+    # WHAT: Geographic heatmaps mapped onto the official NYC shapefiles.
+    # -------------------------------------------------------------------------
     plot_manhattan_heatmap(df_clean)
-
 
 # =============================================================================
 # 3. STATISTICS
 # =============================================================================
 
 def print_statistics(df_step1, df_manhattan, df_clean):
-    """Prints key dataset statistics for the report."""
+    """Prints key dataset statistics for the final academic report."""
     final_bins = pd.cut(df_clean['trip_distance'], bins=DIST_BINS, labels=DIST_LABELS)
 
     print("\n" + "=" * 55)
@@ -450,7 +456,6 @@ def print_statistics(df_step1, df_manhattan, df_clean):
     for f in MODEL_FEATURES:
         print(f"  - {f}")
 
-
 # =============================================================================
 # 4. MAIN
 # =============================================================================
@@ -458,16 +463,18 @@ def print_statistics(df_step1, df_manhattan, df_clean):
 if __name__ == "__main__":
     print(f"Looking for data at: {FILE_PATH}")
 
-    result = run_preprocessing()
-    if result is None:
-        exit()
+    # Use the local EDA loader instead of the ML preprocessing script
+    df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan = load_eda_data()
 
-    X_train, X_test, y_train, y_test, kfold, df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan = result
+    # Determine which features survived the quasi-constant check
+    active_features = get_active_features(df_clean)
+    
+    # Add our target encoded feature for PCA analysis
+    if 'PU_fare_avg' not in active_features:
+        active_features.append('PU_fare_avg')
 
-    active_features = get_active_features(df_manhattan)
-    run_diagnostics(df_manhattan, active_features)
-    run_pca_99(df_manhattan, active_features)
-
+    run_diagnostics(df_clean, active_features)
+    run_pca_99(df_clean, active_features)
+    
     run_visuals(df_step1, df_manhattan, df_work, df_clean, zone_map_manhattan)
-
     print_statistics(df_step1, df_manhattan, df_clean)
