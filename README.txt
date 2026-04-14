@@ -34,6 +34,6 @@ This project was developed using the Spyder IDE. However, you can use any IDE of
 
 ## Data Requirements
 
-The script expects the following file to be present in the project root directory:
+The script expects the following file to be present in the project Data root directory:
 - yellow_tripdata_2025-01.parquet
 
