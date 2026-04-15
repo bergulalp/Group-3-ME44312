@@ -58,18 +58,25 @@ def main():
     Main execution function. Runs preprocessing, fast baseline comparisons, 
     deep model tuning, and the final metric evaluation.
     """
+    # Print which features we are going to use
+    print(f"\n[CONFIG MODE] Currently executing with FEATURE_MODE = '{config.FEATURE_MODE}'")
+    if config.FEATURE_MODE != 'FULL':
+        print(f"  -> Using a reduced feature set ({len(config.MODEL_FEATURES)} features).")
+
     print("=== STEP 1: Preprocessing ===")
+    
+    # Stability check to make sure, balanced dataset is deleted.
+    cache_path = os.path.join(config.PROCESSED_DATA_DIR, "balanced_data.joblib")
+    if os.path.exists(cache_path):
+        print(f"[Warning] Delete '{cache_path}'")
+
     # Extract the preprocessed features, targets, and cross-validation strategy
     X_train, X_test, y_train, y_test, kfold = run_preprocessing()
 
     # --- SUBSET FOR RANDOM FOREST TUNING ---
-    # Random Forests train extremely slowly on hundreds of thousands of rows. 
-    # We subset the training data here specifically for RF to save compute time.
     subset_size = 150000
     if len(X_train) > subset_size:
         print(f"[INFO] Training set is large ({len(X_train)} rows). Subsetting {subset_size} for RF tuning...")
-        # We sample both X and y using the same random_state to ensure rows stay aligned.
-        # Using .sample() avoids pandas duplicate index explosion issues.
         X_train_rf = X_train.sample(n=subset_size, random_state=42)
         y_train_rf = y_train.sample(n=subset_size, random_state=42)
     else:
@@ -79,7 +86,7 @@ def main():
     models_to_compare = {
         "Linear Baseline": {
             "pipe": get_baseline_lg(),
-            "params": {} # Linear Regression doesn't need hyperparameter tuning here
+            "params": {} 
         },
         "Random Forest": {
             "pipe": get_rf_model(),
@@ -98,14 +105,9 @@ def main():
     }
 
     # === STEP 2: Fast Evaluation ===
-    # Evaluate the shallow models on a 20k row subset to establish a baseline
     fast_model_comparison(X_train, y_train, kfold, models_to_compare)
 
     # === STEP 3: Deep Parameter Tuning — RF and XGBoost ===
-    # We import the deep grids directly from config.py to ensure consistency 
-    # between this script and plot_final_results.py.
-
-    # Execute tuning for Random Forest using the smaller subset
     rf_pipeline = deep_tune_model(
         model_name="RandomForest",
         pipe=get_rf_model(),
@@ -115,7 +117,6 @@ def main():
         kfold=kfold
     )
 
-    # Execute tuning for XGBoost using the complete training dataset
     xgb_pipeline = deep_tune_model(
         model_name="XGBoost",
         pipe=get_xgb_model(),
@@ -126,10 +127,9 @@ def main():
     )
 
     # === STEP 4: Final Evaluation ===
-    # Compare both fully optimized models strictly against the unseen test dataset.
     print("\n=== FINAL EVALUATION ON UNSEEN TEST DATA ===")
     
-    all_january_metrics = []  # Collect metrics for optional seasonality comparison
+    all_january_metrics = []  
     
     for model_name, pipeline, save_name in [
         ("Deep Tuned RF",      rf_pipeline,  "Random Forest"),
@@ -137,7 +137,6 @@ def main():
     ]:
         y_pred = pipeline.predict(X_test)
         
-        # Use save_name so seasonality script can match by model name
         final_metrics = calculate_metrics(y_test, y_pred, model_name=save_name)
         all_january_metrics.append(final_metrics)
         
@@ -147,11 +146,10 @@ def main():
             
         plot_results(y_test, y_pred, model_name=model_name)
 
-    # Save January test metrics for optional later comparison in test_seasonality.py
-    # This file is not required — test_seasonality.py will warn if it's missing
     results_path = os.path.join(config.PROJECT_ROOT, "Models", "january_test_metrics.joblib")
     joblib.dump(all_january_metrics, results_path)
     print(f"\n[INFO] January test metrics saved to: {results_path}")
 
+    
 if __name__ == "__main__":
     main()
