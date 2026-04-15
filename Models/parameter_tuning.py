@@ -117,7 +117,10 @@ def deep_tune_model(model_name, pipe, param_grid, X_train, y_train, kfold):
         
         # 3. Manually transform the data through the preprocessor so XGBoost can read it
         preprocessor = best_pipeline.named_steps['pre']
-        X_sub_train_trans = preprocessor.fit_transform(X_sub_train)
+        
+        # Fit only on sub_train, transform both
+        preprocessor.fit(X_sub_train)
+        X_sub_train_trans = preprocessor.transform(X_sub_train)
         X_val_trans = preprocessor.transform(X_val)
         
         # 4. Fit with the eval_set to trigger early stopping

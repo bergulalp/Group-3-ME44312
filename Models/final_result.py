@@ -22,6 +22,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
+import joblib
+import os
 
 from preprocessing import main as run_preprocessing
 from models import get_baseline_lg, get_rf_model, get_xgb_model
@@ -126,19 +128,30 @@ def main():
     # === STEP 4: Final Evaluation ===
     # Compare both fully optimized models strictly against the unseen test dataset.
     print("\n=== FINAL EVALUATION ON UNSEEN TEST DATA ===")
-
-    for model_name, pipeline in [("Deep Tuned RF", rf_pipeline), ("Deep Tuned XGBoost", xgb_pipeline)]:
-        # Generate predictions on the hold-out test set
+    
+    all_january_metrics = []  # Collect metrics for optional seasonality comparison
+    
+    for model_name, pipeline, save_name in [
+        ("Deep Tuned RF",      rf_pipeline,  "Random Forest"),
+        ("Deep Tuned XGBoost", xgb_pipeline, "XGBoost")
+    ]:
         y_pred = pipeline.predict(X_test)
         
-        # Calculate and print formatting metrics
-        final_metrics = calculate_metrics(y_test, y_pred, model_name=model_name)
+        # Use save_name so seasonality script can match by model name
+        final_metrics = calculate_metrics(y_test, y_pred, model_name=save_name)
+        all_january_metrics.append(final_metrics)
+        
         print(f"\n--- {model_name} ---")
         for k, v in final_metrics.items():
             print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
             
-        # Display the actual vs predicted scatter plot
         plot_results(y_test, y_pred, model_name=model_name)
+
+    # Save January test metrics for optional later comparison in test_seasonality.py
+    # This file is not required — test_seasonality.py will warn if it's missing
+    results_path = os.path.join(config.PROJECT_ROOT, "Models", "january_test_metrics.joblib")
+    joblib.dump(all_january_metrics, results_path)
+    print(f"\n[INFO] January test metrics saved to: {results_path}")
 
 if __name__ == "__main__":
     main()

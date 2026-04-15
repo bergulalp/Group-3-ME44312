@@ -52,8 +52,6 @@ def _make_cyclic_transformer(period):
     Wraps the mathematical _sin_cos_encode function into a scikit-learn 
     compatible FunctionTransformer.
     """
-    # Note: Passing kw_args={'period': period} explicitly is required so that 
-    # joblib can successfully serialize (save) this pipeline to disk later.
     return FunctionTransformer(func=_sin_cos_encode, kw_args={'period': period}, validate=False)
 
 def build_pipeline(model):
