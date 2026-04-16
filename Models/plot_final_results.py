@@ -14,6 +14,8 @@
 # 4. Error Heatmaps: To identify specific combinations where the model struggles.
 # 5. Combined Feature Importance: A single plot comparing feature importance across 
 #    Linear Regression, Random Forest, and XGBoost, and printing the 95% threshold.
+# 6. Learning Curves: Diagnoses bias vs. variance by plotting training and 
+#    validation performance against increasing training set sizes.
 # =============================================================================
 
 from pathlib import Path
@@ -22,6 +24,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.model_selection import learning_curve
 
 from preprocessing import main as run_preprocessing
 from parameter_tuning import deep_tune_model
@@ -46,12 +49,13 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 SAMPLE_HEXBIN   = 50_000
 SAMPLE_RESIDUAL = 50_000
 SAMPLE_SHAP     = 500 # Kept small for Linear Regression SHAP calculation
+SAMPLE_LC       = 100_000 # Sample size for learning curves to ensure reasonable runtime
 
 # Plot style configuration
 sns.set_theme(style="whitegrid", context="talk")
 plt.rcParams.update({"figure.dpi": 140, "axes.titleweight": "bold"})
 
-# --- Helper Functions ---
+# Helper Functions
 
 def save_close(fig, filename: str):
     """Saves the figure to the output directory and closes it to free memory."""
@@ -77,7 +81,7 @@ def get_feature_names():
     names += config.PASSTHROUGH_FEATURES
     return names
 
-# --- Standard Plotting Functions ---
+# Standard Plotting Functions
 
 def plot_model_comparison(results):
     """Plots a bar chart comparing MAE, RMSE, and R² across different models."""
@@ -140,7 +144,7 @@ def plot_residual_by_fare_bin(y_true, y_pred, model_name: str, filename: str):
     ax.legend()
     save_close(fig, filename)
 
-# --- Advanced Analytical Plots ---
+# Advanced Analytical Plots
 
 def plot_most_and_least_accurate(X_test, y_test, y_pred, model_name: str, top_n=15):
     """Identifies and plots the top N trips with the highest absolute error."""
@@ -264,7 +268,52 @@ def plot_combined_importance(X_test, models_dict):
     plt.close()
     print("  Saved: combined_feature_importance.png")
 
-# Main Execution ---
+def plot_learning_curves(models_dict, X, y, kfold):
+    """
+    Computes and plots learning curves for all models in the dictionary.
+    Helps identify if models would benefit from more data or suffer from high variance.
+    """
+    print("\n=== STEP 5: Computing Learning Curves ===")
+    train_sizes = np.linspace(0.1, 1.0, 5)
+
+    for name, pipeline in models_dict.items():
+        print(f"  Generating learning curve for {name}...")
+        
+        # Calculate learning curve data using negative MAE (consistent with project scoring)
+        train_sizes_abs, train_scores, test_scores = learning_curve(
+            pipeline, X, y, 
+            train_sizes=train_sizes, 
+            cv=kfold, 
+            scoring='neg_mean_absolute_error', 
+            n_jobs=-1,
+            random_state=42
+        )
+
+        # Process scores (convert back to positive MAE)
+        train_mean = -np.mean(train_scores, axis=1)
+        train_std  = np.std(train_scores, axis=1)
+        test_mean  = -np.mean(test_scores, axis=1)
+        test_std   = np.std(test_scores, axis=1)
+
+        plt.figure(figsize=(10, 6))
+        plt.plot(train_sizes_abs, train_mean, 'o-', color="r", label="Training score")
+        plt.plot(train_sizes_abs, test_mean, 'o-', color="g", label="Cross-validation score")
+        
+        plt.fill_between(train_sizes_abs, train_mean - train_std, train_mean + train_std, alpha=0.1, color="r")
+        plt.fill_between(train_sizes_abs, test_mean - test_std, test_mean + test_std, alpha=0.1, color="g")
+
+        plt.title(f"Learning Curve: {name}", fontsize=14)
+        plt.xlabel("Training Examples", fontsize=12)
+        plt.ylabel("Mean Absolute Error ($)", fontsize=12)
+        plt.legend(loc="best")
+        plt.grid(True, alpha=0.3)
+        
+        prefix = name.lower().replace(" ", "_")
+        plt.savefig(OUTPUT_DIR / f"{prefix}_learning_curve.png", bbox_inches="tight")
+        plt.close()
+        print(f"  Saved: {prefix}_learning_curve.png")
+
+# Main Execution -
 
 def main():
     print("=== STEP 1: Loading Data ===")
@@ -310,6 +359,10 @@ def main():
 
     # Trigger combined importance plot and 95% print statements
     plot_combined_importance(X_test, models_dict)
+
+    # Trigger Learning Curve generation
+    X_lc, y_lc = sample_xy(X_train, y_train, SAMPLE_LC)
+    plot_learning_curves(models_dict, X_lc, y_lc, kfold)
     
     print(f"\nDone! All plots saved to: {OUTPUT_DIR.resolve()}")
 
